@@ -7,19 +7,37 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.net.*
+import java.util.concurrent.Executors
 
 data class Host(
     val ip: String,
     val hostname: String?,
     val openPorts: List<Int>,
     val pingMs: Long?,
+    val mac: String? = null,
+    val info: String? = null,
 ) {
     val adb get() = 5555 in openPorts
+
+    /** Tebakan jenis perangkat dari port/info yang terdeteksi. */
+    val guess: String?
+        get() = when {
+            5555 in openPorts -> "Android (ADB aktif)"
+            8008 in openPorts || 8009 in openPorts -> "Android TV / Chromecast"
+            62078 in openPorts -> "iPhone / iPad"
+            7000 in openPorts -> "Apple / AirPlay"
+            445 in openPorts || 3389 in openPorts -> "PC / Laptop Windows"
+            9100 in openPorts -> "Printer"
+            info?.contains("samsung", true) == true -> "Samsung"
+            info?.contains("tv", true) == true -> "Smart TV"
+            22 in openPorts -> "Linux / server SSH"
+            else -> null
+        }
 }
 
 data class LocalNet(val ip: String, val prefix: Int, val start: String, val end: String)
 
-val SCAN_PORTS = listOf(5555, 80, 443, 22, 53, 445, 8080, 8008, 7000, 62078, 554, 8000)
+val SCAN_PORTS = listOf(5555, 80, 443, 8008, 8009, 7000, 8080, 22, 445, 62078, 9100, 3389)
 
 fun ipToLong(ip: String): Long? {
     val p = ip.trim().split(".")
@@ -64,26 +82,119 @@ fun detectLocalNet(ctx: Context): LocalNet? {
     return null
 }
 
-private fun probe(ip: String, timeoutMs: Int): Pair<Boolean, List<Int>> {
-    val open = mutableListOf<Int>()
-    var alive = false
-    for (port in SCAN_PORTS) {
-        try {
-            Socket().use { s ->
-                s.connect(InetSocketAddress(ip, port), timeoutMs)
-                open += port
-                alive = true
-            }
-        } catch (e: ConnectException) {
-            // ditolak (RST) = host hidup, port tertutup
-            if (e.message?.contains("refused", true) == true) alive = true
-        } catch (_: Exception) {
-        }
-    }
-    return alive to open
+
+private val netDisp = Executors.newCachedThreadPool().asCoroutineDispatcher()
+private val bgScope = CoroutineScope(SupervisorJob() + netDisp)
+
+/** 1 = port terbuka, 0 = ditolak (host hidup), -1 = tidak ada respons */
+private fun tcpProbe(ip: String, port: Int, timeoutMs: Int): Int = try {
+    Socket().use { it.connect(InetSocketAddress(ip, port), timeoutMs) }
+    1
+} catch (e: ConnectException) {
+    if (e.message?.contains("refused", true) == true) 0 else -1
+} catch (_: Exception) {
+    -1
 }
 
-/** Pindai start..end; panggil onHost tiap host hidup, onProgress(selesai, total). */
+private class UdpResult(val alive: Boolean, val name: String?, val info: String?)
+
+private val NETBIOS_Q = byteArrayOf(0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x20) +
+    "CK".toByteArray() + ByteArray(30) { 'A'.code.toByte() } + byteArrayOf(0, 0, 0x21, 0, 1)
+private val SSDP_Q = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n" +
+    "MX: 1\r\nST: ssdp:all\r\n\r\n").toByteArray()
+private val MDNS_Q = byteArrayOf(0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0) +
+    byteArrayOf(9) + "_services".toByteArray() + byteArrayOf(7) + "_dns-sd".toByteArray() +
+    byteArrayOf(4) + "_udp".toByteArray() + byteArrayOf(5) + "local".toByteArray() +
+    byteArrayOf(0, 0, 12, 0, 1)
+
+/**
+ * Kirim beberapa probe UDP sekaligus (NetBIOS, SSDP, mDNS, port tertutup).
+ * Balasan data ATAU ICMP "port unreachable" = host hidup (meski semua port TCP tertutup/di-firewall).
+ */
+private fun udpProbe(ip: String, timeoutMs: Int): UdpResult {
+    val addr = InetAddress.getByName(ip)
+    val probes = listOf(137 to NETBIOS_Q, 1900 to SSDP_Q, 5353 to MDNS_Q, 33434 to byteArrayOf(0))
+    val socks = mutableListOf<Pair<Int, DatagramSocket>>()
+    var alive = false
+    var name: String? = null
+    var info: String? = null
+    try {
+        for ((port, data) in probes) {
+            try {
+                val s = DatagramSocket()
+                s.connect(addr, port)
+                s.send(DatagramPacket(data, data.size))
+                socks += port to s
+            } catch (_: Exception) {
+            }
+        }
+        val buf = ByteArray(2048)
+        val done = mutableSetOf<Int>()
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && done.size < socks.size) {
+            for ((port, s) in socks) {
+                if (port in done) continue
+                s.soTimeout = 30
+                try {
+                    val p = DatagramPacket(buf, buf.size)
+                    s.receive(p)
+                    alive = true
+                    done += port
+                    when (port) {
+                        137 -> if (p.length > 72) name = String(buf, 57, 15, Charsets.ISO_8859_1).trim().ifEmpty { null }
+                        1900 -> {
+                            val txt = String(buf, 0, p.length, Charsets.ISO_8859_1)
+                            info = txt.lines().firstOrNull { it.startsWith("SERVER:", true) }
+                                ?.substringAfter(":")?.trim()
+                        }
+                    }
+                } catch (_: PortUnreachableException) {
+                    alive = true
+                    done += port
+                } catch (_: SocketTimeoutException) {
+                } catch (_: Exception) {
+                    done += port
+                }
+            }
+            if (alive && System.currentTimeMillis() > deadline - timeoutMs / 2) break
+        }
+    } finally {
+        socks.forEach { runCatching { it.second.close() } }
+    }
+    return UdpResult(alive, name, info)
+}
+
+private suspend fun probeHost(ip: String, timeoutMs: Int): Host? = coroutineScope {
+    val t0 = System.currentTimeMillis()
+    val udp = async(netDisp) { runCatching { udpProbe(ip, timeoutMs) }.getOrNull() }
+    val tcp = SCAN_PORTS.map { p -> p to async(netDisp) { tcpProbe(ip, p, timeoutMs) } }
+    val u = udp.await()
+    val open = mutableListOf<Int>()
+    var alive = u?.alive == true
+    for ((p, d) in tcp) {
+        val r = d.await()
+        if (r == 1) open += p
+        if (r >= 0) alive = true
+    }
+    if (!alive) null
+    else Host(ip, u?.name, open.sorted(), System.currentTimeMillis() - t0, null, u?.info)
+}
+
+/** Tabel ARP (hanya terbaca di sebagian versi Android) → ip to mac. */
+private fun readArp(): Map<String, String> = try {
+    java.io.File("/proc/net/arp").readLines().drop(1).mapNotNull {
+        val c = it.trim().split(Regex("\\s+"))
+        if (c.size >= 4 && c[3] != "00:00:00:00:00:00" && c[2] != "0x0") c[0] to c[3] else null
+    }.toMap()
+} catch (_: Exception) {
+    emptyMap()
+}
+
+/**
+ * Pindai start..end dua putaran (putaran kedua mengulang IP yang belum terdeteksi, karena
+ * perangkat yang tidur sering baru membalas setelah ARP pertama). onHost bisa dipanggil lagi
+ * untuk IP yang sama (update nama/MAC). Fungsi return setelah scan SELESAI.
+ */
 suspend fun scanRange(
     start: Long,
     end: Long,
@@ -91,35 +202,55 @@ suspend fun scanRange(
     onProgress: (Int, Int) -> Unit,
     onHost: (Host) -> Unit,
 ) = coroutineScope {
-    val total = (end - start + 1).toInt()
-    val sem = Semaphore(48)
-    var done = 0
-    val jobs = (start..end).map { v ->
-        launch(Dispatchers.IO) {
-            sem.withPermit {
-                val ip = longToIp(v)
-                val t0 = System.currentTimeMillis()
-                val reachable = try {
-                    InetAddress.getByName(ip).isReachable(timeoutMs)
-                } catch (_: Exception) {
-                    false
-                }
-                val ping = if (reachable) System.currentTimeMillis() - t0 else null
-                val (alive, open) = probe(ip, minOf(timeoutMs, 400))
-                if (reachable || alive) {
-                    val name = withTimeoutOrNull(1500) {
-                        runInterruptible {
-                            val h = InetAddress.getByName(ip).canonicalHostName
-                            if (h == ip) null else h
+    val n = (end - start + 1).toInt()
+    val found = java.util.concurrent.ConcurrentHashMap<String, Host>()
+    val lock = Any()
+
+    suspend fun pass(ips: List<Long>, base: Int, total: Int) {
+        val sem = Semaphore(24)
+        var done = 0
+        ips.map { v ->
+            launch {
+                sem.withPermit {
+                    val ip = longToIp(v)
+                    val h = probeHost(ip, timeoutMs)
+                    if (h != null) {
+                        found[ip] = h
+                        onHost(h)
+                        // nama via reverse DNS: terpisah, tidak menahan scan
+                        bgScope.launch {
+                            val nm = withTimeoutOrNull(2500) {
+                                runInterruptible { InetAddress.getByName(ip).canonicalHostName.takeIf { it != ip } }
+                            }
+                            val cur = found[ip]
+                            if (nm != null && cur != null && cur.hostname == null) {
+                                val upd = cur.copy(hostname = nm)
+                                found[ip] = upd
+                                onHost(upd)
+                            }
                         }
                     }
-                    onHost(Host(ip, name, open, ping))
                 }
+                synchronized(lock) { done++; onProgress(base + done, total) }
             }
-            synchronized(jobs0) { done++; onProgress(done, total) }
-        }
+        }.joinAll()
     }
-    jobs.joinAll()
-}
 
-private val jobs0 = Any()
+    val all = (start..end).toList()
+    pass(all, 0, n * 2)
+    val missing = all.filter { !found.containsKey(longToIp(it)) }
+    onProgress(n, n + missing.size)
+    pass(missing, n, n + missing.size)
+
+    // lengkapi dengan tabel ARP (jika bisa dibaca)
+    val arp = readArp()
+    for ((ip, mac) in arp) {
+        val v = ipToLong(ip) ?: continue
+        if (v !in start..end) continue
+        val cur = found[ip]
+        val upd = (cur ?: Host(ip, null, emptyList(), null)).copy(mac = mac)
+        found[ip] = upd
+        onHost(upd)
+    }
+    onProgress(1, 1)
+}
