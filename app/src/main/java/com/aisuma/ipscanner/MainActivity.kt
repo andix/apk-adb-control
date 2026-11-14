@@ -52,9 +52,12 @@ class ScanState(ctx: Context) {
     val net = detectLocalNet(ctx)
     var start by mutableStateOf(net?.start ?: "192.168.1.1")
     var end by mutableStateOf(net?.end ?: "192.168.1.254")
-    var timeout by mutableStateOf("800")
+    var timeout by mutableStateOf("1000")
     val hosts = mutableStateListOf<Host>()
-    var progress by mutableStateOf(0 to 0)
+    var progress by mutableStateOf(0f)
+    var phase by mutableStateOf("")
+    var note by mutableStateOf<String?>(null)
+    var started by mutableStateOf(false)
     var job: Job? = null
     var scanning by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
@@ -95,25 +98,29 @@ fun ScanScreen(st: ScanState, onConnected: (AdbSession) -> Unit) {
         if (e - s + 1 > 4096) { st.error = "Maksimal 4096 IP per scan"; return }
         st.error = null
         st.hosts.clear()
-        st.progress = 0 to (e - s + 1).toInt()
+        st.progress = 0f
+        st.phase = "Memulai…"
+        st.note = null
+        st.started = true
         st.scanning = true
         st.job = scope.launch {
             try {
-            scanRange(s, e, st.timeout.toIntOrNull()?.coerceIn(100, 5000) ?: 500,
-                onProgress = { d, t -> st.progress = d to t },
-                onHost = { h ->
-                    scope.launch {
-                        val i = st.hosts.indexOfFirst { it.ip == h.ip }
-                        if (i >= 0) st.hosts[i] = st.hosts[i].let { o ->
-                            h.copy(hostname = h.hostname ?: o.hostname, mac = h.mac ?: o.mac,
-                                info = h.info ?: o.info, pingMs = h.pingMs ?: o.pingMs,
-                                openPorts = h.openPorts.ifEmpty { o.openPorts })
-                        } else {
-                            st.hosts.add(h)
-                            st.hosts.sortBy { ipToLong(it.ip) }
+                NetScanner(
+                    ctx, s, e, st.timeout.toIntOrNull()?.coerceIn(200, 5000) ?: 1000,
+                    onProgress = { ph, d, t ->
+                        scope.launch { st.phase = ph; st.progress = if (t > 0) d / t.toFloat() else 0f }
+                    },
+                    onHost = { h ->
+                        scope.launch {
+                            val i = st.hosts.indexOfFirst { it.ip == h.ip }
+                            if (i >= 0) st.hosts[i] = h else {
+                                st.hosts.add(h)
+                                st.hosts.sortBy { ipToLong(it.ip) }
+                            }
                         }
-                    }
-                })
+                    },
+                    onNote = { n -> scope.launch { st.note = n } },
+                ).run()
             } finally {
                 st.scanning = false
             }
@@ -155,14 +162,14 @@ fun ScanScreen(st: ScanState, onConnected: (AdbSession) -> Unit) {
                 }
             }
             st.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            if (st.progress.second > 0) {
-                LinearProgressIndicator(
-                    progress = { st.progress.first / st.progress.second.toFloat() },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Text(if (scanning) "${st.progress.first}/${st.progress.second} dipindai · ${st.hosts.size} host aktif"
+            if (st.started) {
+                LinearProgressIndicator(progress = { st.progress }, modifier = Modifier.fillMaxWidth())
+                Text(
+                    if (scanning) "${st.phase} · ${(st.progress * 100).toInt()}% · ${st.hosts.size} host"
                     else "Selesai · ${st.hosts.size} host aktif",
-                    style = MaterialTheme.typography.bodySmall)
+                    style = MaterialTheme.typography.bodySmall
+                )
+                st.note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.tertiary) }
             }
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -180,7 +187,15 @@ fun ScanScreen(st: ScanState, onConnected: (AdbSession) -> Unit) {
                             }
                             h.guess?.let { Text(it, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary) }
                             h.hostname?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-                            h.info?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                            h.model?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                            h.info?.let { Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 2) }
+                            if (h.services.isNotEmpty())
+                                Text("Layanan: " + h.services.joinToString(", ") { it.removePrefix("_") },
+                                    style = MaterialTheme.typography.bodySmall)
+                            if (h.via.isNotEmpty())
+                                Text("Terdeteksi via " + h.via.joinToString(" · "),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
                             h.mac?.let { Text("MAC $it", style = MaterialTheme.typography.bodySmall) }
                             if (h.openPorts.isNotEmpty())
                                 Text("Port: " + h.openPorts.joinToString(", "), style = MaterialTheme.typography.bodySmall)
