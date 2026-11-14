@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -84,6 +86,7 @@ fun ScanScreen(st: ScanState, onConnected: (AdbSession) -> Unit) {
     val scope = rememberCoroutineScope()
     val scanning = st.scanning
     var selected by remember { mutableStateOf<Host?>(null) }
+    var manual by remember { mutableStateOf(false) }
 
     fun resetDefault() {
         val n = detectLocalNet(ctx)
@@ -138,6 +141,13 @@ fun ScanScreen(st: ScanState, onConnected: (AdbSession) -> Unit) {
                     )
                 }
             })
+        },
+        floatingActionButton = {
+            ExtendedFloatingActionButton(
+                onClick = { manual = true },
+                icon = { Icon(Icons.Default.Edit, null) },
+                text = { Text("IP manual") },
+            )
         }
     ) { pad ->
         Column(
@@ -174,7 +184,7 @@ fun ScanScreen(st: ScanState, onConnected: (AdbSession) -> Unit) {
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.weight(1f),
-                contentPadding = PaddingValues(bottom = 16.dp)
+                contentPadding = PaddingValues(bottom = 88.dp)
             ) {
                 items(st.hosts, key = { it.ip }) { h ->
                     ElevatedCard(onClick = { selected = h }, modifier = Modifier.fillMaxWidth()) {
@@ -207,22 +217,43 @@ fun ScanScreen(st: ScanState, onConnected: (AdbSession) -> Unit) {
     }
 
     selected?.let { host -> HostSheet(host, onDismiss = { selected = null }, onConnected = { selected = null; onConnected(it) }) }
+    if (manual) HostSheet(null, onDismiss = { manual = false }, onConnected = { manual = false; onConnected(it) })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HostSheet(host: Host, onDismiss: () -> Unit, onConnected: (AdbSession) -> Unit) {
+fun HostSheet(host: Host?, onDismiss: () -> Unit, onConnected: (AdbSession) -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    var port by remember { mutableStateOf("5555") }
+    val prefs = remember { ctx.getSharedPreferences("app", Context.MODE_PRIVATE) }
+    // host == null → mode isi manual: IP (atau IP:port) diketik sendiri, terakhir dipakai diingat
+    var ipText by remember { mutableStateOf(host?.ip ?: prefs.getString("last_ip", "") ?: "") }
+    var port by remember { mutableStateOf(if (host == null) prefs.getString("last_port", "5555") ?: "5555" else "5555") }
+    val targetIp = ipText.trim().substringBefore(":")
     var connecting by remember { mutableStateOf<Job?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
 
     ModalBottomSheet(onDismissRequest = { if (connecting == null) onDismiss() }) {
         Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(host.ip, style = MaterialTheme.typography.headlineSmall, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
-            host.hostname?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
-            if (!host.adb) Text(
+            if (host == null) {
+                Text("Connect ke IP manual", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                OutlinedTextField(
+                    ipText,
+                    { v ->
+                        ipText = v.trim()
+                        v.substringAfter(":", "").filter(Char::isDigit).takeIf { it.isNotEmpty() }?.let { port = it }
+                    },
+                    label = { Text("IP / host tujuan (boleh IP:port)") },
+                    placeholder = { Text("192.168.1.50") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                Text(host.ip, style = MaterialTheme.typography.headlineSmall, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                host.hostname?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+            }
+            if (host != null && !host.adb) Text(
                 "Port 5555 tidak terdeteksi terbuka. Aktifkan dulu di target (adb tcpip 5555), atau isi port lain.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error
             )
@@ -231,11 +262,13 @@ fun HostSheet(host: Host, onDismiss: () -> Unit, onConnected: (AdbSession) -> Un
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Button(
                 modifier = Modifier.fillMaxWidth(),
+                enabled = targetIp.isNotEmpty() && (port.toIntOrNull() ?: 0) in 1..65535,
                 onClick = {
                     error = null
+                    if (host == null) prefs.edit().putString("last_ip", targetIp).putString("last_port", port).apply()
                     connecting = scope.launch {
                         try {
-                            onConnected(connectAdb(ctx, host.ip, port.toIntOrNull() ?: 5555))
+                            onConnected(connectAdb(ctx, targetIp, port.toIntOrNull() ?: 5555))
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Throwable) {
@@ -245,7 +278,7 @@ fun HostSheet(host: Host, onDismiss: () -> Unit, onConnected: (AdbSession) -> Un
                     }
                 }
             ) { Text("Connect to ADB") }
-            OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
+            if (host != null) OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
                 val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cm.setPrimaryClip(ClipData.newPlainText("ip", host.ip))
                 Toast.makeText(ctx, "Disalin", Toast.LENGTH_SHORT).show()
@@ -260,7 +293,7 @@ fun HostSheet(host: Host, onDismiss: () -> Unit, onConnected: (AdbSession) -> Un
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     LinearProgressIndicator(Modifier.fillMaxWidth())
-                    Text("Buka layar perangkat ${host.ip} lalu ketuk “Izinkan” pada dialog “Allow USB debugging?”. Centang “Selalu izinkan” agar tidak ditanya lagi.")
+                    Text("Buka layar perangkat $targetIp lalu ketuk “Izinkan” pada dialog “Allow USB debugging?”. Centang “Selalu izinkan” agar tidak ditanya lagi.")
                 }
             },
             confirmButton = {

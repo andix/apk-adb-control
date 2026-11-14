@@ -26,11 +26,50 @@ class AdbSession(val dadb: Dadb, val host: String, val port: Int) {
     fun close() = runCatching { dadb.close() }
 }
 
+/**
+ * Kunci RSA 2048 untuk autentikasi ADB. Dibuat & disimpan sendiri (AdbKeyPair.generate dari dadb
+ * menghasilkan file kosong di Android). Private key: PKCS#8 DER (base64). Public key: format adb
+ * ("<base64 struct RSA android> nama"), dikirim ke perangkat saat dialog "Allow USB debugging?".
+ */
 private fun loadKeyPair(ctx: Context): AdbKeyPair {
-    val priv = File(ctx.filesDir, "adbkey")
-    val pub = File(ctx.filesDir, "adbkey.pub")
-    if (!priv.exists() || !pub.exists()) AdbKeyPair.generate(priv, pub)
-    return AdbKeyPair.read(priv, pub)
+    val privF = File(ctx.filesDir, "adb_rsa.key")
+    val pubF = File(ctx.filesDir, "adb_rsa.pub")
+    val kf = java.security.KeyFactory.getInstance("RSA")
+    runCatching {
+        val der = android.util.Base64.decode(privF.readText(), android.util.Base64.DEFAULT)
+        val pub = pubF.readBytes()
+        if (der.isNotEmpty() && pub.size > 100) {
+            return AdbKeyPair(kf.generatePrivate(java.security.spec.PKCS8EncodedKeySpec(der)), pub + 0)
+        }
+    }
+    val gen = java.security.KeyPairGenerator.getInstance("RSA")
+    gen.initialize(2048)
+    val kp = gen.genKeyPair()
+    val pubLine = (android.util.Base64.encodeToString(adbPublicKey(kp.public as java.security.interfaces.RSAPublicKey),
+        android.util.Base64.NO_WRAP) + " ipscanner@" + android.os.Build.MODEL.replace(" ", "_")).toByteArray()
+    privF.writeText(android.util.Base64.encodeToString(kp.private.encoded, android.util.Base64.NO_WRAP))
+    pubF.writeBytes(pubLine)
+    return AdbKeyPair(kp.private, pubLine + 0)
+}
+
+/** Struktur RSAPublicKey milik adb/mincrypt: len, n0inv, n[], rr[], e (semua little-endian). */
+private fun adbPublicKey(pub: java.security.interfaces.RSAPublicKey): ByteArray {
+    val words = 64
+    val r32 = java.math.BigInteger.ONE.shiftLeft(32)
+    val n = pub.modulus
+    val n0inv = r32.subtract(n.mod(r32).modInverse(r32)).mod(r32)
+    val rr = java.math.BigInteger.ONE.shiftLeft(words * 32 * 2).mod(n)
+    val bb = java.nio.ByteBuffer.allocate(4 + 4 + words * 4 * 2 + 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+    bb.putInt(words)
+    bb.putInt(n0inv.toLong().toInt())
+    fun putBig(x: java.math.BigInteger) {
+        var v = x
+        repeat(words) { bb.putInt(v.mod(r32).toLong().toInt()); v = v.shiftRight(32) }
+    }
+    putBig(n)
+    putBig(rr)
+    bb.putInt(pub.publicExponent.toInt())
+    return bb.array()
 }
 
 /**
